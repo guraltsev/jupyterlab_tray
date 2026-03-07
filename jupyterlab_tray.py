@@ -1,12 +1,18 @@
-# jlab_tray.py  (Windows)
-# Advanced JupyterLab tray helper.
-#
-# USAGE:
-#   python jlab_tray.py              -> Launches tray in background.
-#   python jlab_tray.py [notebook]   -> Opens notebook.
-#
-# TROUBLESHOOTING:
-#   Check log at: %TEMP%\jlab_tray.log  (rotating)
+#!/usr/bin/env python
+"""JupyterLab Tray Helper (Windows-focused)
+
+Design goals:
+- `--help` must always print (even if GUI deps are missing).
+- Single-instance via local IPC + handshake + port file in %TEMP%.
+- Priority 1-4 improvements:
+  1) Safer shutdown: HTTP /api/shutdown first, PID kill as fallback with safety check.
+  2) Better open-path: if no server, start rooted at requested path; prefer servers that can see the path.
+  3) Robust IPC: handshake + port file + ephemeral port fallback.
+  4) Better diagnostics: rotating log + more debug logs.
+
+Log: %TEMP%\\jlab_tray.log
+IPC info: %TEMP%\\jlab_tray_ipc.json
+"""
 
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ import functools
 import glob
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import socket
@@ -27,108 +34,219 @@ import time
 import traceback
 import uuid
 import webbrowser
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.error import HTTPError, URLError
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
 
-# ---------------- Constants ----------------
 APP_ID = "jlab_tray"
-LOG_FILE = Path(tempfile.gettempdir()) / "jlab_tray.log"
 IPC_INFO_FILE = Path(tempfile.gettempdir()) / "jlab_tray_ipc.json"
+LOG_FILE = Path(tempfile.gettempdir()) / "jlab_tray.log"
 
-# Timeouts / tuning knobs
+DEFAULT_IPC_PORT = 8765
+
+MENU_REFRESH_SECONDS = 2.0
+TOKEN_WAIT_SECONDS = 2.0
+SERVER_START_WAIT_SECONDS = 15.0
+TCP_ALIVE_TIMEOUT = 0.2
 IPC_CONNECT_TIMEOUT = 0.5
-IPC_READ_TIMEOUT = 0.8
-DISCOVERY_MONITOR_INTERVAL = 2.0
-OPEN_WAIT_FOR_SERVER_SEC = 15.0
-WAIT_FOR_TOKEN_SEC = 2.0
-HTTP_SHUTDOWN_TIMEOUT = 1.0
+HTTP_SHUTDOWN_TIMEOUT = 2.0
 
 
-# ---------------- Logging ----------------
-# Rotating logs makes intermittent failures easier to debug.
-# Set env var JLAB_TRAY_LOG_LEVEL=DEBUG for more detail.
-LOG_LEVEL_NAME = (os.environ.get("JLAB_TRAY_LOG_LEVEL") or "INFO").upper().strip()
-LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+# -------------------- Small UX helpers --------------------
 
-_handler = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=3, encoding="utf-8")
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[_handler],
-)
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
-# ---------------- Imports & Dep Check ----------------
-try:
-    import pystray
-    from PIL import Image, ImageDraw
-    from pystray import Menu, MenuItem
-
-    import win32api  # check for pywin32
-except ImportError as e:
-    # If this is the main process (foreground), warn the user
-    if "--foreground" in sys.argv or "jlab_tray.py" in sys.argv[0]:
-        print(f"!! Missing dependencies: {e}")
-        print(f"   Run: {sys.executable} -m pip install -U pystray pillow pywin32")
-    sys.exit(1)
-
-
-# ---------------- Small utilities ----------------
-
-def _redact_token(url: str) -> str:
-    """Return a URL with any `token=` query param value replaced."""
+def _stdout_is_tty() -> bool:
     try:
-        p = urlsplit(url)
-        if not p.query or "token=" not in p.query:
-            return url
-        q = [(k, "REDACTED" if k == "token" else v) for k, v in parse_qsl(p.query, keep_blank_values=True)]
-        return urlunsplit((p.scheme, p.netloc, p.path, urlencode(q, doseq=True), p.fragment))
+        return bool(sys.stdout) and sys.stdout.isatty()
     except Exception:
-        # Best-effort fallback
-        return url.replace("token=", "token=REDACTED")
+        return False
 
 
-# ---------------- Helpers ----------------
 
-def _tcp_alive(url: str, timeout: float = 0.2) -> bool:
+def _has_windows_console() -> bool:
+    """True if this process has a console window (Windows only)."""
+    if not _is_windows():
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        return False
+
+
+def _print_or_messagebox(title: str, text: str) -> None:
+    """Prefer printing if a console exists; otherwise use a message box."""
+    if _has_windows_console():
+        try:
+            sys.stdout.write(text.rstrip() + "\n")
+            sys.stdout.flush()
+            return
+        except Exception:
+            pass
+    _message_box_error(title, text)
+
+def _message_box_error(title: str, text: str) -> None:
+    """Show a Windows message box (best effort)."""
+    if not _is_windows():
+        return
+    try:
+        import ctypes
+
+        MB_OK = 0x00000000
+        MB_ICONERROR = 0x00000010
+        ctypes.windll.user32.MessageBoxW(0, text, title, MB_OK | MB_ICONERROR)
+    except Exception:
+        pass
+
+
+
+
+def _script_dir() -> Path:
+    """Best-effort directory containing this script/executable."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            return Path(str(meipass)).resolve()
+        except Exception:
+            pass
+
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        pass
+
+    try:
+        return Path(sys.argv[0]).resolve().parent
+    except Exception:
+        pass
+
+    return Path.cwd()
+
+
+def _find_tray_icon_path() -> Optional[Path]:
+    """Locate tray icon file.
+
+    Prefer a `jupyterlab.ico` placed next to the script.
+    Falls back to checking a few plausible runtime directories.
+    """
+    candidate_dirs: List[Path] = []
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        try:
+            candidate_dirs.append(Path(str(meipass)))
+        except Exception:
+            pass
+
+    try:
+        candidate_dirs.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+
+    try:
+        candidate_dirs.append(Path(sys.argv[0]).resolve().parent)
+    except Exception:
+        pass
+
+    try:
+        candidate_dirs.append(Path.cwd())
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    for d in candidate_dirs:
+        try:
+            d2 = d.resolve()
+        except Exception:
+            d2 = d
+
+        key = str(d2)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            p = d2 / "jupyterlab.ico"
+            if p.exists() and p.is_file():
+                return p
+        except Exception:
+            pass
+
+    return None
+
+def _configure_logging(level_name: str, also_console: bool) -> None:
+    level = getattr(logging, (level_name or "INFO").upper(), logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Reset handlers (avoid duplicates if re-entered)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=512 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root.addHandler(file_handler)
+
+    if also_console:
+        ch = logging.StreamHandler(stream=sys.stdout)
+        ch.setLevel(level)
+        ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        root.addHandler(ch)
+
+
+# -------------------- Lazy GUI deps --------------------
+
+
+class MissingDependencies(RuntimeError):
+    pass
+
+
+def _import_tray_deps():
+    """Import GUI deps lazily so `--help` always works."""
+    try:
+        import pystray
+        from pystray import Menu, MenuItem
+        from PIL import Image, ImageDraw
+
+        # Windows backend: pywin32
+        import win32api  # noqa: F401
+
+        return pystray, Menu, MenuItem, Image, ImageDraw
+    except Exception as e:
+        raise MissingDependencies(
+            "Missing GUI dependencies. Install with:\n"
+            f"  {sys.executable} -m pip install -U pystray pillow pywin32\n\n"
+            f"Import error: {e}"
+        )
+
+
+# -------------------- Networking helpers --------------------
+
+
+def _tcp_alive(url: str, timeout: float = TCP_ALIVE_TIMEOUT) -> bool:
     try:
         p = urlsplit(url)
         host = p.hostname or "127.0.0.1"
         if host in ("0.0.0.0", "::"):
             host = "127.0.0.1"
         port = p.port or (443 if p.scheme == "https" else 80)
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((host, int(port)), timeout=float(timeout)):
             return True
     except OSError:
         return False
 
 
-def get_jupyter_runtime_dir() -> Path | None:
-    # 1. Ask jupyter --paths
-    try:
-        cmd = [sys.executable, "-m", "jupyter", "--paths", "--json"]
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-        data = json.loads(out)
-        runtime_dirs = data.get("runtime", [])
-        if runtime_dirs:
-            return Path(runtime_dirs[0])
-    except Exception:
-        logging.debug("Failed to get runtime dir via jupyter --paths: %s", traceback.format_exc())
-
-    # 2. Fallback
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        default_path = Path(appdata) / "jupyter" / "runtime"
-        if default_path.exists():
-            return default_path
-    return None
-
-
-def _norm_host(host: str | None) -> str:
-    """Normalize hostnames so the same local server doesn't show up multiple times."""
+def _norm_host(host: Optional[str]) -> str:
     if not host:
         return "127.0.0.1"
     h = str(host).strip().lower()
@@ -137,7 +255,7 @@ def _norm_host(host: str | None) -> str:
     return h
 
 
-def _extract_host_port(url: str, fallback_port: int | str | None = None) -> tuple[str, int | None]:
+def _extract_host_port(url: str, fallback_port: Optional[int] = None) -> Tuple[str, Optional[int]]:
     try:
         p = urlsplit(url)
         host = _norm_host(p.hostname)
@@ -149,17 +267,47 @@ def _extract_host_port(url: str, fallback_port: int | str | None = None) -> tupl
         return "127.0.0.1", None
 
 
-def _pid_int(pid) -> int | None:
+def _pid_int(x: Any) -> Optional[int]:
     try:
-        if pid is None:
+        if x is None:
             return None
-        return int(pid)
+        return int(x)
     except Exception:
         return None
 
 
-def _server_score(d: dict) -> int:
-    """Heuristic for choosing the best record among duplicates."""
+# -------------------- Jupyter runtime discovery --------------------
+
+
+def get_jupyter_runtime_dir() -> Optional[Path]:
+    # Honor env var if set
+    env_dir = os.environ.get("JUPYTER_RUNTIME_DIR")
+    if env_dir:
+        p = Path(env_dir)
+        if p.exists():
+            return p
+
+    # Ask: python -m jupyter --paths --json
+    try:
+        out = subprocess.check_output([sys.executable, "-m", "jupyter", "--paths", "--json"], stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+        runtime_dirs = data.get("runtime", [])
+        if runtime_dirs:
+            return Path(runtime_dirs[0])
+    except Exception:
+        logging.debug("Failed to get runtime dir via jupyter --paths", exc_info=True)
+
+    # Fallback
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        p = Path(appdata) / "jupyter" / "runtime"
+        if p.exists():
+            return p
+
+    return None
+
+
+def _server_score(d: Dict[str, Any]) -> int:
     score = 0
     if d.get("token"):
         score += 5
@@ -167,24 +315,23 @@ def _server_score(d: dict) -> int:
         score += 3
     if d.get("base_url"):
         score += 2
-    if d.get("_source_file", "").lower().startswith("jpserver-"):
+    if str(d.get("_source_file", "")).lower().startswith("jpserver-"):
         score += 1
     if d.get("pid") is not None:
         score += 1
     return score
 
 
-def list_live_servers(runtime_dir: Path | None):
-    """Discover running Jupyter servers via runtime JSON files, deduped by (host, port)."""
+def list_live_servers(runtime_dir: Optional[Path]) -> List[Dict[str, Any]]:
     if not runtime_dir or not runtime_dir.exists():
         return []
 
     patterns = [runtime_dir / "nbserver-*.json", runtime_dir / "jpserver-*.json"]
-    files: list[str] = []
+    files: List[str] = []
     for pat in patterns:
         files.extend(glob.glob(str(pat)))
 
-    unique: dict[tuple[str, int], dict] = {}
+    unique: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     for fpath in files:
         try:
@@ -195,12 +342,11 @@ def list_live_servers(runtime_dir: Path | None):
             if not url:
                 continue
 
-            host, port = _extract_host_port(url, data.get("port"))
+            host, port = _extract_host_port(url, _pid_int(data.get("port")))
             if port is None:
                 continue
 
-            # Normalize/augment
-            data["port"] = port
+            data["port"] = int(port)
             data["pid"] = _pid_int(data.get("pid"))
             data["_host"] = host
             data["_source_file"] = Path(fpath).name
@@ -208,27 +354,22 @@ def list_live_servers(runtime_dir: Path | None):
             if not _tcp_alive(url):
                 continue
 
-            key = (host, port)
+            key = (host, int(port))
             if key not in unique or _server_score(data) > _server_score(unique[key]):
                 unique[key] = data
 
-        except json.JSONDecodeError:
-            logging.debug("Bad JSON in runtime file %s", fpath)
-        except OSError:
-            logging.debug("Failed to read runtime file %s", fpath)
         except Exception:
-            logging.debug("Unexpected error while scanning %s: %s", fpath, traceback.format_exc())
+            logging.debug("Failed to parse runtime file: %s", fpath, exc_info=True)
 
-    final_list = list(unique.values())
-    final_list.sort(key=lambda d: (int(d.get("port", 0)), str(d.get("_host", ""))))
-    return final_list
+    out_list = list(unique.values())
+    out_list.sort(key=lambda d: (int(d.get("port", 0)), str(d.get("_host", ""))))
+    return out_list
 
 
-# ---------------- URL + server selection helpers ----------------
-
-def _server_root_url(server: dict) -> str:
-    """Base URL for API requests (scheme://host:port + base_url)."""
-    base = str(server.get("url", "") or "")
+def _server_root_url(server: Dict[str, Any]) -> str:
+    base = str(server.get("url") or "")
+    if not base:
+        return ""
     if not base.endswith("/"):
         base += "/"
 
@@ -241,60 +382,52 @@ def _server_root_url(server: dict) -> str:
     return urljoin(base, base_url)
 
 
-def lab_url(server: dict, target: Path | None = None) -> str:
+def _redact_token(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        q = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "token"]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+    except Exception:
+        if "token=" in url:
+            return url.split("token=")[0] + "token=REDACTED"
+        return url
+
+
+def lab_url(server: Dict[str, Any], target: Optional[Path] = None) -> str:
     root = _server_root_url(server)
-    token = str(server.get("token", "") or "")
+    if not root.endswith("/"):
+        root += "/"
+
+    token = str(server.get("token") or "")
 
     if target is None:
         url = urljoin(root, "lab")
     else:
-        root_dir = str(server.get("root_dir", "") or "")
+        root_dir = str(server.get("root_dir") or "")
         try:
-            rel = target.resolve().relative_to(Path(root_dir).resolve())
-            lab_path = rel.as_posix()
+            if root_dir:
+                rel = target.resolve(strict=False).relative_to(Path(root_dir).resolve(strict=False))
+                lab_path = rel.as_posix()
+            else:
+                lab_path = target.resolve(strict=False).as_posix()
         except Exception:
-            lab_path = target.resolve().as_posix()
+            lab_path = target.resolve(strict=False).as_posix()
+
         url = urljoin(root, "lab/tree/") + quote(lab_path, safe="/-._~")
 
     if token and "token=" not in url:
         joiner = "&" if "?" in url else "?"
         url = f"{url}{joiner}token={quote(token)}"
+
     return url
 
 
-def _server_can_see_target(server: dict, target: Path) -> bool:
-    root_dir = server.get("root_dir")
-    if not root_dir:
-        return False
-    try:
-        target.resolve().relative_to(Path(str(root_dir)).resolve())
-        return True
-    except Exception:
-        return False
+# -------------------- Server selection --------------------
 
 
-def _choose_best_server(servers: list[dict], target: Path | None) -> dict | None:
-    if not servers:
-        return None
-    if target is None:
-        return max(servers, key=_server_score)
-
-    visible = [s for s in servers if _server_can_see_target(s, target)]
-    if visible:
-        return max(visible, key=_server_score)
-
-    return max(servers, key=_server_score)
-
-
-def _best_server_for_host_port(
-    runtime_dir: Path | None,
-    host: str,
-    port: int,
-    wait_for_token: float = WAIT_FOR_TOKEN_SEC,
-) -> dict | None:
-    """Re-read runtime JSON at click time to avoid capturing token-less records."""
+def _best_server_for_host_port(runtime_dir: Optional[Path], host: str, port: int, wait_for_token: float = TOKEN_WAIT_SECONDS) -> Optional[Dict[str, Any]]:
     deadline = time.time() + max(0.0, float(wait_for_token))
-    best: dict | None = None
+    best: Optional[Dict[str, Any]] = None
 
     while True:
         try:
@@ -305,77 +438,50 @@ def _best_server_for_host_port(
                 if best.get("token") or time.time() >= deadline:
                     return best
         except Exception:
-            logging.debug("_best_server_for_host_port error: %s", traceback.format_exc())
+            logging.debug("Error selecting best server", exc_info=True)
 
         if time.time() >= deadline:
             return best
         time.sleep(0.1)
 
 
-# ---------------- Start / Open actions ----------------
-
-def open_browser_action(icon, item, url=None):
-    if not url:
-        return
-    logging.info("Opening: %s", _redact_token(str(url)))
+def _path_under_root(target: Path, root_dir: str) -> bool:
+    if not root_dir:
+        return False
     try:
-        webbrowser.open(str(url), new=2)
+        target.resolve(strict=False).relative_to(Path(root_dir).resolve(strict=False))
+        return True
     except Exception:
-        try:
-            os.startfile(str(url))
-        except Exception:
-            logging.error("Failed to open browser for %s", _redact_token(str(url)))
+        return False
 
 
-def open_server_action(icon, item, app=None, host=None, port=None, target: Path | None = None):
-    """Open a server by (host, port), computing the URL at click time."""
-    if app is None or host is None or port is None:
-        return
-
-    try:
-        host_n = _norm_host(str(host))
-        port_n = int(port)
-    except Exception:
-        return
-
-    s = _best_server_for_host_port(getattr(app, "runtime_dir", None), host_n, port_n)
-    if not s:
-        # Fallback: open a reasonable base URL (may still require manual auth).
-        base = f"http://{host_n}:{port_n}/"
-        open_browser_action(icon, item, url=urljoin(base, "lab"))
-        return
-
-    open_browser_action(icon, item, url=lab_url(s, target))
-
-
-def _root_for_new_server(target: Path | None) -> Path | None:
+def _pick_best_server_for_path(servers: List[Dict[str, Any]], target: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if not servers:
+        return None
     if target is None:
-        return None
-    try:
-        # Existing paths: directories are the root, files use parent.
-        if target.exists():
-            return target if target.is_dir() else target.parent
+        return max(servers, key=_server_score)
 
-        # Non-existent paths: best-effort heuristic.
-        # If it looks like a file (has a suffix), use its parent.
-        return target.parent if target.suffix else target
-    except Exception:
-        return None
+    visible = [s for s in servers if _path_under_root(target, str(s.get("root_dir") or ""))]
+    if visible:
+        return max(visible, key=_server_score)
+
+    return max(servers, key=_server_score)
 
 
-def start_server_action(icon, item, root: Path | None = None):
-    """Start a new JupyterLab server (optionally rooted at `root`)."""
-    try:
-        root_path = (root or Path.home()).expanduser().resolve()
-    except Exception:
-        root_path = Path.home()
+# -------------------- Start / Open --------------------
 
-    logging.info("Starting new server (root=%s)...", str(root_path))
 
+def _creationflags_no_window() -> int:
+    if not _is_windows():
+        return 0
     flags = 0
-    if os.name == "nt":
-        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return flags
+
+
+def start_server(root_dir: Path) -> None:
+    root_dir = root_dir.expanduser().resolve(strict=False)
 
     cmd = [
         sys.executable,
@@ -383,286 +489,200 @@ def start_server_action(icon, item, root: Path | None = None):
         "jupyterlab",
         "--no-browser",
         "--ServerApp.open_browser=False",
+        f"--ServerApp.root_dir={str(root_dir)}",
     ]
 
-    # If the user is opening a specific notebook/path, root the server there so
-    # /lab/tree/<relative> is reliable.
-    if root is not None:
-        cmd += ["--ServerApp.root_dir", str(root_path)]
-
+    logging.info("Starting new server (root_dir=%s)", str(root_dir))
     try:
         subprocess.Popen(
             cmd,
-            cwd=str(root_path),
+            cwd=str(root_dir),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=flags,
+            creationflags=_creationflags_no_window(),
+            close_fds=True,
         )
     except Exception:
-        logging.error("Failed to start server: %s", traceback.format_exc())
+        logging.error("Failed to start server", exc_info=True)
 
 
-def quit_action(icon, item, app=None):
-    if app:
-        app.quit()
+def open_in_browser(url: str) -> None:
+    logging.info("Opening: %s", _redact_token(url))
+    try:
+        webbrowser.open(url, new=2)
+        return
+    except Exception:
+        logging.debug("webbrowser.open failed", exc_info=True)
+
+    if _is_windows():
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+        except Exception:
+            logging.error("os.startfile failed", exc_info=True)
 
 
-# ---------------- Shutdown (Priority 1) ----------------
-
-def _shutdown_api_url(server: dict) -> str:
-    return urljoin(_server_root_url(server), "api/shutdown")
+# -------------------- Priority 1: safer shutdown --------------------
 
 
-def _http_shutdown(server: dict, timeout: float = HTTP_SHUTDOWN_TIMEOUT) -> bool:
-    """Best-effort graceful shutdown via Jupyter's /api/shutdown."""
-    base = _shutdown_api_url(server)
+def _http_post(url: str, timeout: float) -> Tuple[bool, str]:
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(url, method="POST")
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+            if 200 <= int(resp.status) < 300:
+                return True, ""
+            return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _shutdown_via_http(server: Dict[str, Any]) -> bool:
+    root = _server_root_url(server)
+    if not root:
+        return False
+
     token = str(server.get("token") or "")
+    base = urljoin(root, "api/shutdown")
 
-    # A few variants; the exact auth expectations can vary by server flavor.
-    attempts: list[tuple[str, str, dict[str, str]]] = []
-
+    urls = []
     if token:
-        # Query-param token is commonly supported.
-        attempts.append(("query", f"{base}?token={quote(token)}", {}))
-        # Header-based auth is supported by some setups.
-        attempts.append(("auth-token", base, {"Authorization": f"token {token}"}))
-        attempts.append(("auth-bearer", base, {"Authorization": f"Bearer {token}"}))
-    else:
-        attempts.append(("noauth", base, {}))
+        joiner = "&" if "?" in base else "?"
+        urls.append(f"{base}{joiner}token={quote(token)}")
+    urls.append(base)
 
-    probe_url = str(server.get("url") or "")
-
-    for label, url, headers in attempts:
-        try:
-            req = Request(url, data=b"", method="POST", headers=headers)
-            with urlopen(req, timeout=float(timeout)) as resp:
-                code = getattr(resp, "status", None) or resp.getcode()
-                if 200 <= int(code) < 400:
-                    logging.info("Shutdown via HTTP succeeded (%s): %s", label, _redact_token(url))
-                    return True
-        except HTTPError as e:
-            # 403/404/etc means the endpoint is reachable but not allowed.
-            logging.debug("HTTP shutdown failed (%s) %s: HTTPError %s", label, _redact_token(url), e.code)
-        except URLError as e:
-            logging.debug("HTTP shutdown failed (%s) %s: URLError %s", label, _redact_token(url), e)
-        except Exception:
-            logging.debug("HTTP shutdown exception (%s) %s: %s", label, _redact_token(url), traceback.format_exc())
-
-        # If the server stopped quickly (sometimes it drops the connection), treat as success.
-        try:
-            time.sleep(0.2)
-            if probe_url and not _tcp_alive(probe_url):
-                logging.info("Server appears down after HTTP shutdown attempt (%s).", label)
-                return True
-        except Exception:
-            pass
+    for u in urls:
+        ok, err = _http_post(u, timeout=HTTP_SHUTDOWN_TIMEOUT)
+        if ok:
+            logging.info("Shutdown via HTTP succeeded (%s)", _redact_token(u))
+            return True
+        logging.debug("Shutdown via HTTP failed (%s): %s", _redact_token(u), err)
 
     return False
 
 
-def _netstat_listening_pids(port: int) -> set[int] | None:
-    """Return PIDs listening on TCP *port* (Windows best-effort), or None if unknown."""
-    if os.name != "nt":
+def _windows_pid_listening_on_port(pid: int, port: int) -> Optional[bool]:
+    if not _is_windows():
         return None
-
     try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        out = subprocess.check_output(
-            ["netstat", "-ano"],
-            stderr=subprocess.DEVNULL,
-            creationflags=flags,
-        )
-        text = out.decode(errors="replace")
+        out = subprocess.check_output(["netstat", "-ano"], stderr=subprocess.DEVNULL)
+        text = out.decode("utf-8", errors="replace")
+        needle = f":{int(port)}"
+        pid_str = str(int(pid))
 
-        pids: set[int] = set()
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
+        saw_port = False
+        for line in text.splitlines():
+            if needle not in line:
                 continue
-            if not line.upper().startswith("TCP"):
+            if "LISTENING" not in line.upper():
                 continue
+            saw_port = True
+            if line.strip().endswith(pid_str):
+                return True
 
-            parts = line.split()
-            # Proto  Local Address          Foreign Address        State           PID
-            if len(parts) < 5:
-                continue
-
-            local_addr = parts[1]
-            state = parts[3]
-            pid_str = parts[4]
-
-            if not local_addr.endswith(f":{port}"):
-                continue
-            if not state.upper().startswith("LISTEN"):
-                continue
-
-            try:
-                pids.add(int(pid_str))
-            except Exception:
-                continue
-
-        return pids
-
-    except Exception:
-        logging.debug("netstat failed: %s", traceback.format_exc())
-        return None
-
-
-def _kill_pid(pid: int, host: str | None = None, port: int | None = None) -> bool:
-    """Last-resort termination; tries to reduce PID-reuse risk on Windows."""
-    try:
-        if pid <= 0:
+        if saw_port:
             return False
-
-        if port is not None:
-            pids = _netstat_listening_pids(int(port))
-            if pids is not None and pid not in pids:
-                logging.warning(
-                    "Refusing to kill pid=%s for %s:%s (netstat shows %s)",
-                    pid,
-                    host or "?",
-                    port,
-                    sorted(pids),
-                )
-                return False
-
-        os.kill(pid, signal.SIGTERM)
-        logging.info("Killed process pid=%s (%s:%s)", pid, host or "?", port or "?")
-        return True
-
-    except Exception:
-        logging.error("Failed to kill pid=%s: %s", pid, traceback.format_exc())
         return False
-
-
-def shutdown_server_action(icon, item, app=None, host=None, port=None, pid=None):
-    """Attempt graceful shutdown; fallback to PID termination if needed."""
-    if host is None or port is None:
-        return
-
-    try:
-        host_n = _norm_host(str(host))
-        port_n = int(port)
     except Exception:
-        return
+        logging.debug("netstat check failed", exc_info=True)
+        return None
 
-    server = None
-    if app is not None:
-        server = _best_server_for_host_port(getattr(app, "runtime_dir", None), host_n, port_n)
 
-    # Fallback record if runtime scan can't find it at click time.
-    if not server:
-        server = {
-            "url": f"http://{host_n}:{port_n}/",
-            "base_url": "/",
-            "token": "",
-            "pid": _pid_int(pid),
-            "port": port_n,
-            "_host": host_n,
-        }
-
-    # Try API shutdown first.
+def shutdown_server(server: Dict[str, Any]) -> None:
+    # 1) Try graceful-ish HTTP shutdown
     try:
-        if _http_shutdown(server):
+        if _shutdown_via_http(server):
             return
     except Exception:
-        logging.debug("HTTP shutdown wrapper failed: %s", traceback.format_exc())
+        logging.debug("HTTP shutdown threw", exc_info=True)
 
-    # Fallback to kill.
-    pid_i = _pid_int(server.get("pid"))
-    if pid_i:
-        _kill_pid(pid_i, host=host_n, port=port_n)
-    else:
-        logging.warning("No PID available; could not force shutdown for %s:%s", host_n, port_n)
+    # 2) PID fallback
+    pid = _pid_int(server.get("pid"))
+    if not pid:
+        logging.warning("No PID available; cannot force shutdown")
+        return
+
+    port = int(server.get("port") or 0)
+    pid_ok = _windows_pid_listening_on_port(pid, port)
+    if pid_ok is False:
+        logging.error("Refusing to kill PID %s: not listening on port %s", pid, port)
+        return
+
+    try:
+        logging.info("Terminating PID %s (fallback)", pid)
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        logging.error("Failed to terminate PID %s", pid, exc_info=True)
 
 
-# ---------------- IPC (Priority 3) ----------------
+# -------------------- Priority 3: IPC (handshake + port file) --------------------
 
-def _read_ipc_info() -> dict | None:
+
+def _atomic_write_json(path: Path, obj: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(str(tmp), str(path))
+
+
+def _write_ipc_info(port: int, instance_id: str) -> None:
+    try:
+        _atomic_write_json(
+            IPC_INFO_FILE,
+            {
+                "app": APP_ID,
+                "instance_id": instance_id,
+                "pid": os.getpid(),
+                "port": int(port),
+                "updated": time.time(),
+            },
+        )
+    except Exception:
+        logging.debug("Failed to write IPC info", exc_info=True)
+
+
+def _read_ipc_info() -> Optional[Dict[str, Any]]:
     try:
         if not IPC_INFO_FILE.exists():
             return None
-        data = json.loads(IPC_INFO_FILE.read_text(encoding="utf-8"))
+        with open(IPC_INFO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
         if not isinstance(data, dict):
             return None
         if data.get("app") != APP_ID:
             return None
-        # Normalize
-        if "port" in data:
-            data["port"] = int(data["port"])
         return data
     except Exception:
-        logging.debug("Failed to read IPC info file: %s", traceback.format_exc())
+        logging.debug("Failed to read IPC info", exc_info=True)
         return None
 
 
-def _write_ipc_info(port: int, instance_id: str):
-    try:
-        data = {
-            "app": APP_ID,
-            "port": int(port),
-            "instance_id": str(instance_id),
-            "pid": int(os.getpid()),
-            "updated": time.time(),
-        }
-        tmp = IPC_INFO_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        tmp.replace(IPC_INFO_FILE)
-        logging.debug("Wrote IPC info: %s", data)
-    except Exception:
-        logging.debug("Failed to write IPC info: %s", traceback.format_exc())
-
-
-def _clear_ipc_info(instance_id: str | None = None):
-    try:
-        if not IPC_INFO_FILE.exists():
-            return
-        if instance_id is not None:
-            data = _read_ipc_info() or {}
-            if data.get("instance_id") != instance_id:
-                return
-        IPC_INFO_FILE.unlink(missing_ok=True)
-    except Exception:
-        logging.debug("Failed to clear IPC info: %s", traceback.format_exc())
-
-
-def _ipc_call(port: int, msg: dict, timeout: float = IPC_CONNECT_TIMEOUT) -> dict | None:
-    """Send a single JSON line to the IPC server and read one JSON line response."""
+def _ipc_roundtrip(port: int, msg: Dict[str, Any], timeout: float = IPC_CONNECT_TIMEOUT) -> Optional[Dict[str, Any]]:
     try:
         with socket.create_connection(("127.0.0.1", int(port)), timeout=float(timeout)) as s:
-            s.settimeout(float(IPC_READ_TIMEOUT))
-            payload = (json.dumps(msg) + "\n").encode("utf-8")
-            s.sendall(payload)
-
-            # Read up to one line.
+            s.settimeout(float(timeout))
+            s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
             data = b""
-            while b"\n" not in data and len(data) < 64 * 1024:
+            while not data.endswith(b"\n"):
                 chunk = s.recv(4096)
                 if not chunk:
                     break
                 data += chunk
-
             if not data:
                 return None
-
-            line = data.decode("utf-8", errors="replace").splitlines()[0].strip()
-            if not line:
-                return None
-            return json.loads(line)
-
+            return json.loads(data.decode("utf-8", errors="replace").strip())
     except Exception:
-        logging.debug("IPC call failed (port=%s msg=%s): %s", port, msg.get("cmd"), traceback.format_exc())
         return None
 
 
-def _ipc_ping(port: int, expected_instance_id: str | None = None) -> bool:
-    resp = _ipc_call(int(port), {"cmd": "ping"}, timeout=IPC_CONNECT_TIMEOUT)
-    if not resp or resp.get("app") != APP_ID or not resp.get("ok"):
-        return False
-    if expected_instance_id is not None and resp.get("instance_id") != expected_instance_id:
-        return False
-    return True
+def _ipc_ping(port: int) -> Optional[Dict[str, Any]]:
+    return _ipc_roundtrip(port, {"cmd": "ping"})
+
+
+def _ipc_send_open(port: int, path: Optional[str]) -> bool:
+    resp = _ipc_roundtrip(port, {"cmd": "open", "path": path})
+    return bool(resp and resp.get("ok"))
 
 
 class IPCHandler(socketserver.StreamRequestHandler):
@@ -672,99 +692,143 @@ class IPCHandler(socketserver.StreamRequestHandler):
             if not line:
                 return
             msg = json.loads(line)
-            cmd = msg.get("cmd")
 
+            cmd = msg.get("cmd")
             if cmd == "ping":
-                resp = {
-                    "app": APP_ID,
-                    "ok": True,
-                    "instance_id": getattr(self.server.app, "instance_id", ""),
-                    "pid": int(os.getpid()),
-                    "port": int(self.server.server_address[1]),
-                }
-                self.wfile.write((json.dumps(resp) + "\n").encode("utf-8"))
+                self.wfile.write(
+                    (json.dumps({"ok": True, "app": APP_ID, "instance_id": getattr(self.server, "instance_id", "")}) + "\n").encode(
+                        "utf-8"
+                    )
+                )
                 self.wfile.flush()
                 return
 
             if cmd == "open":
-                path = msg.get("path")
-                p = Path(path) if path else None
-                threading.Thread(target=self.server.app.handle_open_request, args=(p,), daemon=True).start()
-
-                self.wfile.write((json.dumps({"app": APP_ID, "ok": True}) + "\n").encode("utf-8"))
+                path_str = msg.get("path")
+                self.wfile.write((json.dumps({"ok": True}) + "\n").encode("utf-8"))
                 self.wfile.flush()
+
+                try:
+                    p = Path(path_str) if path_str else None
+                except Exception:
+                    p = None
+
+                threading.Thread(target=self.server.app.handle_open_request, args=(p,), daemon=True).start()  # type: ignore[attr-defined]
                 return
 
-            # Unknown command.
-            self.wfile.write((json.dumps({"app": APP_ID, "ok": False, "error": "unknown_cmd"}) + "\n").encode("utf-8"))
+            self.wfile.write((json.dumps({"ok": False, "error": "unknown cmd"}) + "\n").encode("utf-8"))
             self.wfile.flush()
 
         except Exception:
-            logging.debug("IPC handler error: %s", traceback.format_exc())
+            logging.debug("IPC handler error", exc_info=True)
 
 
 class IPCServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, app):
+    def __init__(self, addr: Tuple[str, int], handler, app: Any, instance_id: str):
         super().__init__(addr, handler)
         self.app = app
+        self.instance_id = instance_id
 
 
-# ---------------- Tray App ----------------
+# -------------------- Tray app --------------------
+
+
 class TrayApp:
-    def __init__(self, ipc_port: int, initial_path: Path | None):
-        self.ipc_port = int(ipc_port)
+    def __init__(self, requested_ipc_port: int, initial_path: Optional[Path]):
+        self.requested_ipc_port = int(requested_ipc_port)
         self.initial_path = initial_path
         self.runtime_dir = get_jupyter_runtime_dir()
+
         self.instance_id = uuid.uuid4().hex
-        self.icon = None
-        self._ipc: IPCServer | None = None
+
         self._stop = threading.Event()
-        self._cached_servers: list[dict] = []
-        logging.info("Runtime Dir: %s", self.runtime_dir)
+        self._cached_sig: List[Tuple[str, int]] = []
 
-    def _make_icon(self):
-        ico_path = Path(__file__).resolve().parent / "jupyterlab.ico"
-        if ico_path.exists():
+        self.pystray = None
+        self.Menu = None
+        self.MenuItem = None
+        self.Image = None
+        self.ImageDraw = None
+
+        self.icon = None
+        self._ipc: Optional[IPCServer] = None
+        self.ipc_port: Optional[int] = None
+
+    def _make_icon_image(self):
+        # Prefer an .ico placed next to the script (e.g. jupyterlab.ico).
+        icon_path = _find_tray_icon_path()
+        if icon_path is not None:
             try:
-                return Image.open(ico_path)
+                img0 = self.Image.open(str(icon_path))
+                # ICOs are often palette-based; convert to RGBA for best compatibility.
+                img = img0.convert("RGBA")
+                logging.info("Loaded tray icon: %s (%sx%s)", str(icon_path), img.size[0], img.size[1])
+                return img
             except Exception:
-                logging.debug("Failed to load .ico: %s", traceback.format_exc())
+                logging.warning("Failed to load tray icon from %s; using fallback", str(icon_path), exc_info=True)
+        else:
+            logging.info("Tray icon file jupyterlab.ico not found; using fallback icon")
 
-        img = Image.new("RGB", (64, 64), (243, 119, 38))
-        d = ImageDraw.Draw(img)
+        # Fallback: simple generated icon.
+        img = self.Image.new("RGB", (64, 64), (243, 119, 38))
+        d = self.ImageDraw.Draw(img)
         d.rectangle((16, 16, 48, 48), fill=(255, 255, 255))
         return img
 
-    def _build_menu(self):
-        items = []
+    def _menu_start_new_server(self, _icon, _item):
+        start_server(Path.home())
 
-        items.append(MenuItem("Start New Server", start_server_action))
+    def _menu_open_server(self, _icon, _item, host: str, port: int):
+        host = _norm_host(host)
+        best = _best_server_for_host_port(self.runtime_dir, host, int(port))
+        if best:
+            open_in_browser(lab_url(best, None))
+        else:
+            open_in_browser(f"http://{host}:{int(port)}/lab")
+
+    def _menu_shutdown_server(self, _icon, _item, host: str, port: int):
+        host = _norm_host(host)
+        best = _best_server_for_host_port(self.runtime_dir, host, int(port), wait_for_token=0.0)
+        if not best:
+            logging.warning("Shutdown requested but server not found for %s:%s", host, port)
+            return
+        shutdown_server(best)
+
+    def _menu_quit(self, _icon, _item):
+        self.quit()
+
+    def _build_menu(self):
+        Menu = self.Menu
+        MenuItem = self.MenuItem
+
+        items = []
+        items.append(MenuItem("Start New Server", self._menu_start_new_server))
         items.append(Menu.SEPARATOR)
 
         try:
             servers = list_live_servers(self.runtime_dir)
-            self._cached_servers = servers
         except Exception:
-            logging.debug("Menu discovery error: %s", traceback.format_exc())
+            logging.debug("list_live_servers failed", exc_info=True)
             servers = []
 
+        self._cached_sig = [(str(s.get("_host") or ""), int(s.get("port") or 0)) for s in servers]
+
         if not servers:
-            items.append(MenuItem("No active servers", lambda i, it: None, enabled=False))
+            items.append(MenuItem("No active servers", lambda _i, _it: None, enabled=False))
         else:
             for s in servers:
-                pid = s.get("pid")
-                port = s.get("port")
-                root = s.get("root_dir", "?")
-                host = s.get("_host") or "127.0.0.1"
-                label = f"{host}:{port}  {os.path.basename(str(root)) or root}"
+                host = str(s.get("_host") or "127.0.0.1")
+                port = int(s.get("port") or 0)
+                root = str(s.get("root_dir") or "")
+                root_label = os.path.basename(root) if root else "(unknown root)"
+                label = f"{host}:{port}  {root_label}"
 
-                open_cb = functools.partial(open_server_action, app=self, host=host, port=port)
-                shutdown_cb = functools.partial(shutdown_server_action, app=self, host=host, port=port, pid=pid)
-
-                shutdown_enabled = bool(pid) or bool(s.get("token"))
+                open_cb = functools.partial(self._menu_open_server, host=host, port=port)
+                shutdown_enabled = bool(_pid_int(s.get("pid")))
+                shutdown_cb = functools.partial(self._menu_shutdown_server, host=host, port=port)
 
                 submenu = Menu(
                     MenuItem("Open Lab", open_cb),
@@ -773,184 +837,159 @@ class TrayApp:
                 items.append(MenuItem(label, submenu))
 
         items.append(Menu.SEPARATOR)
-        items.append(MenuItem("Quit Tray", functools.partial(quit_action, app=self)))
+        items.append(MenuItem("Quit Tray", self._menu_quit))
 
         return Menu(*items)
 
     def _monitor(self):
         while not self._stop.is_set():
-            time.sleep(DISCOVERY_MONITOR_INTERVAL)
+            time.sleep(MENU_REFRESH_SECONDS)
+
             try:
-                current = list_live_servers(self.runtime_dir)
-                curr_sig = [(s.get("_host"), s.get("port")) for s in current]
-                cache_sig = [(s.get("_host"), s.get("port")) for s in self._cached_servers]
-
-                if curr_sig != cache_sig and self.icon:
+                servers = list_live_servers(self.runtime_dir)
+                sig = [(str(s.get("_host") or ""), int(s.get("port") or 0)) for s in servers]
+                if sig != self._cached_sig and self.icon is not None:
                     logging.info("Updating menu...")
-                    self.icon.menu = self._build_menu()
-            except Exception:
-                logging.error("Monitor error: %s", traceback.format_exc())
+                    try:
+                        self.icon.menu = self._build_menu()
+                        if hasattr(self.icon, "update_menu"):
+                            try:
+                                self.icon.update_menu()  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                    except Exception:
+                        logging.debug("Menu update failed", exc_info=True)
 
-    def handle_open_request(self, path: Path | None):
-        logging.info("Open request: %s", path)
+                if self.ipc_port is not None:
+                    _write_ipc_info(self.ipc_port, self.instance_id)
+
+            except Exception:
+                logging.debug("Monitor thread error", exc_info=True)
+
+    def _derive_root_dir_for_target(self, target: Optional[Path]) -> Path:
+        if target is None:
+            return Path.home()
+
+        try:
+            if target.exists() and target.is_dir():
+                return target
+            if target.exists() and target.is_file():
+                return target.parent
+        except Exception:
+            pass
+
+        try:
+            if target.suffix:
+                return target.parent
+        except Exception:
+            pass
+
+        return Path.home()
+
+    def handle_open_request(self, path: Optional[Path]) -> None:
+        logging.info("Open request: %s", str(path) if path else "(none)")
 
         servers = list_live_servers(self.runtime_dir)
 
         if not servers:
-            # Priority 2A: when opening a path and no server exists, root the
-            # new server at that path's directory.
-            root = _root_for_new_server(path)
-            start_server_action(None, None, root=root)
+            # Priority 2-A
+            root_dir = self._derive_root_dir_for_target(path)
+            start_server(root_dir)
 
-            deadline = time.time() + OPEN_WAIT_FOR_SERVER_SEC
+            deadline = time.time() + SERVER_START_WAIT_SECONDS
             while time.time() < deadline:
+                time.sleep(0.5)
                 servers = list_live_servers(self.runtime_dir)
                 if servers:
                     break
-                time.sleep(0.5)
 
         if not servers:
-            logging.warning("No servers found after waiting; open request ignored.")
+            logging.error("No servers found")
             return
 
-        # Priority 2B: prefer a server that can actually see the requested file.
-        best = _choose_best_server(servers, path)
+        # Priority 2-B
+        best = _pick_best_server_for_path(servers, path)
+        if best is None:
+            logging.error("Failed to select a server")
+            return
 
-        if best and not best.get("token"):
-            # Briefly re-scan to allow a token-bearing runtime record to appear.
-            deadline2 = time.time() + WAIT_FOR_TOKEN_SEC
+        # Late-bind token
+        if not best.get("token"):
+            deadline2 = time.time() + TOKEN_WAIT_SECONDS
             while time.time() < deadline2:
-                updated = list_live_servers(self.runtime_dir)
-                if not updated:
-                    break
-                cand = _choose_best_server(updated, path)
+                time.sleep(0.1)
+                servers2 = list_live_servers(self.runtime_dir)
+                cand = _pick_best_server_for_path(servers2, path)
                 if cand and cand.get("token"):
                     best = cand
                     break
-                time.sleep(0.1)
 
-        if best:
-            open_browser_action(None, None, url=lab_url(best, path))
+        open_in_browser(lab_url(best, path))
 
-    def quit(self):
+    def quit(self) -> None:
         self._stop.set()
-
         try:
             if self._ipc:
                 self._ipc.shutdown()
-                self._ipc.server_close()
         except Exception:
-            logging.debug("IPC shutdown error: %s", traceback.format_exc())
-
-        _clear_ipc_info(self.instance_id)
-
-        if self.icon:
-            self.icon.stop()
-
-    def run(self):
-        # Start IPC
+            pass
         try:
-            try:
-                self._ipc = IPCServer(("127.0.0.1", self.ipc_port), IPCHandler, self)
-            except OSError as e:
-                logging.warning("IPC port %s busy (%s); binding ephemeral port.", self.ipc_port, e)
-                self._ipc = IPCServer(("127.0.0.1", 0), IPCHandler, self)
-                self.ipc_port = int(self._ipc.server_address[1])
-
-            threading.Thread(target=self._ipc.serve_forever, daemon=True).start()
-            _write_ipc_info(self.ipc_port, self.instance_id)
-            logging.info("IPC listening on 127.0.0.1:%s", self.ipc_port)
-
+            if self.icon:
+                self.icon.stop()
         except Exception:
-            logging.error("Failed to start IPC: %s", traceback.format_exc())
+            pass
 
-        # Handle initial path
-        if self.initial_path:
+    def run(self) -> None:
+        self.pystray, self.Menu, self.MenuItem, self.Image, self.ImageDraw = _import_tray_deps()
+
+        logging.info("Runtime Dir: %s", str(self.runtime_dir))
+
+        # Bind IPC: preferred port, else ephemeral.
+        self.ipc_port = None
+        for p in (int(self.requested_ipc_port), 0):
+            try:
+                self._ipc = IPCServer(("127.0.0.1", p), IPCHandler, app=self, instance_id=self.instance_id)
+                self.ipc_port = int(self._ipc.server_address[1])
+                threading.Thread(target=self._ipc.serve_forever, daemon=True).start()
+                break
+            except OSError:
+                continue
+
+        if self.ipc_port is None:
+            raise RuntimeError("Failed to bind IPC server")
+
+        _write_ipc_info(self.ipc_port, self.instance_id)
+        logging.info("IPC listening on 127.0.0.1:%s", self.ipc_port)
+
+        if self.initial_path is not None:
             threading.Thread(target=self.handle_open_request, args=(self.initial_path,), daemon=True).start()
 
-        # Start Monitor
         threading.Thread(target=self._monitor, daemon=True).start()
 
-        # Run Tray
-        self.icon = pystray.Icon("JupyterLab", self._make_icon(), "JupyterLab Tray", menu=self._build_menu())
+        self.icon = self.pystray.Icon(
+            "JupyterLab",
+            self._make_icon_image(),
+            "JupyterLab Tray",
+            menu=self._build_menu(),
+        )
         self.icon.run()
 
 
-# ---------------- Main ----------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("path", nargs="?")
-    ap.add_argument("--ipc-port", type=int, default=8765)
-    ap.add_argument("--foreground", action="store_true")  # Debug/Internal
-    args = ap.parse_args()
+# -------------------- Detach --------------------
 
-    target = Path(args.path).expanduser().resolve() if args.path else None
 
-    # Priority 3: locate existing tray more safely via a handshake.
-    ipc_info = _read_ipc_info()
-
-    candidate_ports: list[int] = []
-    if ipc_info and isinstance(ipc_info.get("port"), int):
-        candidate_ports.append(int(ipc_info["port"]))
-    candidate_ports.append(int(args.ipc_port))
-
-    # De-dupe, keep order
-    ports: list[int] = []
-    for p in candidate_ports:
-        if p not in ports:
-            ports.append(p)
-
-    tray_port: int | None = None
-
-    for p in ports:
-        expected_id = None
-        if ipc_info and int(ipc_info.get("port", -1)) == int(p):
-            expected_id = ipc_info.get("instance_id")
-
-        if _ipc_ping(p, expected_instance_id=expected_id):
-            tray_port = int(p)
-            break
-
-    if tray_port is not None:
-        resp = _ipc_call(
-            tray_port,
-            {"cmd": "open", "path": str(target) if target else None},
-            timeout=IPC_CONNECT_TIMEOUT,
-        )
-        if resp and resp.get("ok"):
-            print(">> Command sent to existing tray.")
-            return 0
-
-    # If IPC info exists but did not ping, clear it (stale / crashed tray).
-    if ipc_info and ipc_info.get("port") is not None:
-        _clear_ipc_info(None)
-
-    # Launch tray
-    is_child = os.environ.get("JLAB_TRAY_CHILD") == "1"
-
-    if args.foreground or is_child:
-        try:
-            TrayApp(args.ipc_port, target).run()
-        except Exception:
-            logging.critical(traceback.format_exc())
-            traceback.print_exc()
-            return 1
-        return 0
-
-    # Detach (background)
-    print(">> Launching background tray...")
-    print(f">> Log: {LOG_FILE}")
-
+def _spawn_detached_child(args: argparse.Namespace, target: Optional[Path]) -> None:
     env = os.environ.copy()
     env["JLAB_TRAY_CHILD"] = "1"
 
     script = str(Path(sys.argv[0]).resolve())
-    cmd = [sys.executable, script, "--foreground", "--ipc-port", str(int(args.ipc_port))]
-    if args.path:
+
+    cmd = [sys.executable, script, "--foreground", "--ipc-port", str(int(args.ipc_port)), "--log-level", str(args.log_level)]
+    if target is not None:
         cmd.append(str(target))
 
     flags = 0
-    if os.name == "nt":
+    if _is_windows():
         flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -964,8 +1003,111 @@ def main():
         creationflags=flags,
         close_fds=True,
     )
-    return 0
+
+
+# -------------------- CLI --------------------
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog=Path(sys.argv[0]).name,
+        description="Windows tray helper for JupyterLab (single-instance IPC).",
+    )
+    ap.add_argument("path", nargs="?", help="Optional file/dir to open in JupyterLab.")
+    ap.add_argument("--ipc-port", type=int, default=DEFAULT_IPC_PORT, help="Preferred IPC port (tray may choose another).")
+    ap.add_argument("--foreground", action="store_true", help="Run in foreground (do not detach).")
+    ap.add_argument(
+        "--log-level",
+        default=os.environ.get("JLAB_TRAY_LOG_LEVEL", "INFO"),
+        help="Logging level (DEBUG/INFO/WARNING/ERROR). Env: JLAB_TRAY_LOG_LEVEL",
+    )
+    return ap
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    # Normalize argv so we can intercept -h/--help even when there's no console (e.g., pythonw/double-click).
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+
+    ap = _build_arg_parser()
+
+    if any(a in ("-h", "--help") for a in argv_list):
+        help_text = ap.format_help()
+        _print_or_messagebox("JupyterLab Tray - Help", help_text)
+        return 0
+
+    args = ap.parse_args(argv_list)
+
+    _configure_logging(str(args.log_level), also_console=bool(args.foreground and _has_windows_console()))
+
+    target: Optional[Path]
+    if args.path:
+        try:
+            target = Path(args.path).expanduser().resolve(strict=False)
+        except Exception:
+            target = Path(args.path)
+    else:
+        target = None
+
+    # Try existing tray first (Priority 3 handshake)
+    candidate_ports: List[int] = []
+
+    info = _read_ipc_info()
+    if info and isinstance(info.get("port"), int):
+        candidate_ports.append(int(info["port"]))
+
+    if int(args.ipc_port) not in candidate_ports:
+        candidate_ports.append(int(args.ipc_port))
+
+    for port in candidate_ports:
+        ping = _ipc_ping(port)
+        if not ping or ping.get("app") != APP_ID:
+            continue
+        if _ipc_send_open(port, str(target) if target is not None else None):
+            _print_or_messagebox(
+                "JupyterLab Tray",
+                f">> Sent open request to existing tray on 127.0.0.1:{port}",
+            )
+            return 0
+
+    # No tray found
+    is_child = os.environ.get("JLAB_TRAY_CHILD") == "1"
+
+    if args.foreground or is_child:
+        try:
+            TrayApp(requested_ipc_port=int(args.ipc_port), initial_path=target).run()
+            return 0
+        except MissingDependencies as e:
+            msg = str(e)
+            logging.error(msg)
+            _print_or_messagebox("JupyterLab Tray - Missing Dependencies", msg)
+            return 1
+        except Exception:
+            logging.critical("Fatal error", exc_info=True)
+            if _has_windows_console():
+                traceback.print_exc()
+            else:
+                _message_box_error("JupyterLab Tray - Error", f"Fatal error. See log:\n{LOG_FILE}")
+            return 1
+
+    # Detach
+    try:
+        _print_or_messagebox(
+            "JupyterLab Tray",
+            "Launching JupyterLab tray in the background...\n"
+            f"Log: {LOG_FILE}\n"
+            f"IPC info: {IPC_INFO_FILE}",
+        )
+        _spawn_detached_child(args, target)
+        return 0
+    except Exception:
+        logging.critical("Failed to spawn detached child", exc_info=True)
+        if _has_windows_console():
+            traceback.print_exc()
+        else:
+            _message_box_error("JupyterLab Tray - Error", f"Failed to launch. See log:\n{LOG_FILE}")
+        return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+
+    raise SystemExit(main())
