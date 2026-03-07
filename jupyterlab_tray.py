@@ -23,6 +23,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -100,6 +101,59 @@ def _message_box_error(title: str, text: str) -> None:
         ctypes.windll.user32.MessageBoxW(0, text, title, MB_OK | MB_ICONERROR)
     except Exception:
         pass
+
+# -------------------- Diagnostics helpers --------------------
+
+_DIR_CREATE_WARNED: set[str] = set()
+
+
+def _ensure_dir(p: Path) -> Path:
+    """Create directory if needed (best effort)."""
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        key = str(p)
+        if key not in _DIR_CREATE_WARNED:
+            _DIR_CREATE_WARNED.add(key)
+            logging.warning("Could not create directory %s: %s", str(p), e)
+        logging.debug("Directory creation failed", exc_info=True)
+    return p
+
+
+def _module_available(modname: str) -> bool:
+    """Return True if a Python module can be imported (without importing it)."""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(modname) is not None
+    except Exception:
+        return False
+
+
+def _format_cmd(cmd: List[str]) -> str:
+    """Human-readable command string for logs (best effort quoting)."""
+
+    def q(s: str) -> str:
+        s = str(s)
+        if not s:
+            return '""'
+        if any(c in s for c in ' \t"'):
+            return '"' + s.replace('"', r'\\"') + '"'
+        return s
+
+    return " ".join(q(x) for x in cmd)
+
+
+_TOKEN_QS_RE = re.compile(r"(\btoken=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_tokens_in_text(text: str) -> str:
+    """Redact token=... fragments that commonly appear in Jupyter URLs."""
+    try:
+        return _TOKEN_QS_RE.sub(r"\\1REDACTED", text)
+    except Exception:
+        return text
+
 
 
 
@@ -279,32 +333,114 @@ def _pid_int(x: Any) -> Optional[int]:
 # -------------------- Jupyter runtime discovery --------------------
 
 
-def get_jupyter_runtime_dir() -> Optional[Path]:
-    # Honor env var if set
+_RUNTIME_DIR_LOGGED = False
+
+
+def get_jupyter_runtime_dir() -> Path:
+    """Return a best-effort Jupyter runtime directory.
+
+    Historically this returned None if we couldn't query Jupyter. That makes the
+    tray look "idle" (no servers found) with no actionable explanation.
+
+    We now:
+      * Try JUPYTER_RUNTIME_DIR.
+      * Try jupyter_core (fast, no subprocess).
+      * Try `python -m jupyter --runtime-dir` and `--paths --json`.
+      * Fall back to the default %APPDATA%/jupyter/runtime (or a temp fallback).
+
+    The directory is created (best effort) so that server discovery has a place
+    to look immediately.
+    """
+
+    global _RUNTIME_DIR_LOGGED
+
+    failures: List[str] = []
+
+    # 1) Honor env var if set
     env_dir = os.environ.get("JUPYTER_RUNTIME_DIR")
     if env_dir:
-        p = Path(env_dir)
-        if p.exists():
-            return p
+        p = _ensure_dir(Path(env_dir).expanduser())
+        if not _RUNTIME_DIR_LOGGED:
+            logging.info("Jupyter runtime dir (env JUPYTER_RUNTIME_DIR): %s", str(p))
+            _RUNTIME_DIR_LOGGED = True
+        return p
 
-    # Ask: python -m jupyter --paths --json
+    # 2) Prefer jupyter_core (no subprocess)
     try:
-        out = subprocess.check_output([sys.executable, "-m", "jupyter", "--paths", "--json"], stderr=subprocess.DEVNULL)
+        from jupyter_core.paths import jupyter_runtime_dir as _jupyter_runtime_dir  # type: ignore
+
+        p = _ensure_dir(Path(_jupyter_runtime_dir()))
+        if not _RUNTIME_DIR_LOGGED:
+            logging.info("Jupyter runtime dir (jupyter_core): %s", str(p))
+            _RUNTIME_DIR_LOGGED = True
+        return p
+    except Exception as e:
+        failures.append(f"jupyter_core: {e}")
+        logging.debug("jupyter_core runtime dir lookup failed", exc_info=True)
+
+    # 3) Subprocess fallbacks (capture stderr for diagnostics)
+    try:
+        out = subprocess.check_output([sys.executable, "-m", "jupyter", "--runtime-dir"], stderr=subprocess.STDOUT)
+        p = _ensure_dir(Path(out.decode("utf-8", errors="replace").strip()))
+        if not _RUNTIME_DIR_LOGGED:
+            logging.info("Jupyter runtime dir (`python -m jupyter --runtime-dir`): %s", str(p))
+            _RUNTIME_DIR_LOGGED = True
+        return p
+    except subprocess.CalledProcessError as e:
+        out = (getattr(e, "output", b"") or b"").decode("utf-8", errors="replace").strip()
+        failures.append(f"python -m jupyter --runtime-dir: exit={e.returncode} output={out[:200]}")
+        logging.debug("`python -m jupyter --runtime-dir` failed", exc_info=True)
+    except Exception as e:
+        failures.append(f"python -m jupyter --runtime-dir: {e}")
+        logging.debug("`python -m jupyter --runtime-dir` failed", exc_info=True)
+
+    try:
+        out = subprocess.check_output([sys.executable, "-m", "jupyter", "--paths", "--json"], stderr=subprocess.STDOUT)
         data = json.loads(out)
         runtime_dirs = data.get("runtime", [])
         if runtime_dirs:
-            return Path(runtime_dirs[0])
-    except Exception:
-        logging.debug("Failed to get runtime dir via jupyter --paths", exc_info=True)
+            p = _ensure_dir(Path(runtime_dirs[0]))
+            if not _RUNTIME_DIR_LOGGED:
+                logging.info("Jupyter runtime dir (`python -m jupyter --paths`): %s", str(p))
+                _RUNTIME_DIR_LOGGED = True
+            return p
+        failures.append("python -m jupyter --paths --json: returned no runtime dirs")
+    except subprocess.CalledProcessError as e:
+        out = (getattr(e, "output", b"") or b"").decode("utf-8", errors="replace").strip()
+        failures.append(f"python -m jupyter --paths --json: exit={e.returncode} output={out[:200]}")
+        logging.debug("`python -m jupyter --paths --json` failed", exc_info=True)
+    except Exception as e:
+        failures.append(f"python -m jupyter --paths --json: {e}")
+        logging.debug("`python -m jupyter --paths --json` failed", exc_info=True)
 
-    # Fallback
+    # 4) Default fallbacks (Windows-focused)
     appdata = os.environ.get("APPDATA")
     if appdata:
-        p = Path(appdata) / "jupyter" / "runtime"
-        if p.exists():
-            return p
+        p = _ensure_dir(Path(appdata) / "jupyter" / "runtime")
+        if not _RUNTIME_DIR_LOGGED:
+            diag = "; ".join(failures[-3:])
+            logging.warning(
+                "Could not query Jupyter for its runtime dir; using fallback: %s. "
+                "If server discovery doesn't work, set JUPYTER_RUNTIME_DIR or install jupyter_core/jupyter. "
+                "Diagnostics: %s",
+                str(p),
+                diag if diag else "(none)",
+            )
+            _RUNTIME_DIR_LOGGED = True
+        return p
 
-    return None
+    p = _ensure_dir(Path(tempfile.gettempdir()) / "jupyter" / "runtime")
+    if not _RUNTIME_DIR_LOGGED:
+        diag = "; ".join(failures[-3:])
+        logging.warning(
+            "Could not query Jupyter and APPDATA is missing; using temp fallback: %s. "
+            "If server discovery doesn't work, set JUPYTER_RUNTIME_DIR. "
+            "Diagnostics: %s",
+            str(p),
+            diag if diag else "(none)",
+        )
+        _RUNTIME_DIR_LOGGED = True
+    return p
 
 
 def _server_score(d: Dict[str, Any]) -> int:
@@ -480,11 +616,35 @@ def _creationflags_no_window() -> int:
     return flags
 
 
-def start_server(root_dir: Path) -> None:
+def start_server(root_dir: Path, runtime_dir: Optional[Path] = None) -> Optional[subprocess.Popen]:
+    """Start a new JupyterLab server.
+
+    Old behavior discarded stdout/stderr, which made failures (missing jupyterlab,
+    import errors, port conflicts, etc.) effectively silent. We now:
+      * Log the full command we run.
+      * Capture combined stdout/stderr and stream it into our rotating log.
+      * Redact token=... in output to avoid leaking auth tokens into logs.
+
+    Returns the Popen instance on success, otherwise None.
+    """
+
     root_dir = root_dir.expanduser().resolve(strict=False)
 
+    if not _module_available("jupyterlab"):
+        msg = (
+            "Cannot start JupyterLab server because the 'jupyterlab' Python module is not installed in this environment.\n"
+            f"Python: {sys.executable}\n"
+            f"Install: {sys.executable} -m pip install -U jupyterlab\n"
+            f"Log: {LOG_FILE}"
+        )
+        logging.error(msg)
+        _print_or_messagebox("JupyterLab Tray - JupyterLab Missing", msg)
+        return None
+
+    # Use -u / PYTHONUNBUFFERED so output shows up quickly in logs.
     cmd = [
         sys.executable,
+        "-u",
         "-m",
         "jupyterlab",
         "--no-browser",
@@ -492,19 +652,77 @@ def start_server(root_dir: Path) -> None:
         f"--ServerApp.root_dir={str(root_dir)}",
     ]
 
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    if runtime_dir is not None:
+        # Ensure the server we start writes its runtime file where we will look.
+        env.setdefault("JUPYTER_RUNTIME_DIR", str(runtime_dir))
+
     logging.info("Starting new server (root_dir=%s)", str(root_dir))
+    logging.info("Server command: %s", _format_cmd(cmd))
+    if runtime_dir is not None:
+        logging.info("Using Jupyter runtime dir: %s", str(runtime_dir))
+
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(root_dir),
+            env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             creationflags=_creationflags_no_window(),
             close_fds=True,
+            text=True,
+            bufsize=1,
         )
     except Exception:
         logging.error("Failed to start server", exc_info=True)
+        _print_or_messagebox(
+            "JupyterLab Tray - Failed to Start",
+            "Failed to start JupyterLab server.\n\n" f"See log: {LOG_FILE}",
+        )
+        return None
+
+    logging.info("Spawned JupyterLab server PID: %s", getattr(proc, "pid", "?"))
+
+    def _pump() -> None:
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                if not line:
+                    continue
+                logging.info("[JupyterLab] %s", _redact_tokens_in_text(line))
+        except Exception:
+            logging.debug("Server output pump failed", exc_info=True)
+        finally:
+            try:
+                rc = proc.poll()
+                if rc is not None:
+                    logging.info("[JupyterLab] process exited (code=%s)", rc)
+            except Exception:
+                pass
+
+    def _early_exit_watch() -> None:
+        try:
+            rc = proc.wait(timeout=2.0)
+            logging.error(
+                "JupyterLab server exited quickly (code=%s). "
+                "Scroll up in the log for [JupyterLab] output (common causes: missing deps, port conflict).",
+                rc,
+            )
+        except subprocess.TimeoutExpired:
+            # Still running - good.
+            return
+        except Exception:
+            logging.debug("Early-exit watcher failed", exc_info=True)
+
+    threading.Thread(target=_pump, daemon=True).start()
+    threading.Thread(target=_early_exit_watch, daemon=True).start()
+
+    return proc
 
 
 def open_in_browser(url: str) -> None:
@@ -779,7 +997,7 @@ class TrayApp:
         return img
 
     def _menu_start_new_server(self, _icon, _item):
-        start_server(Path.home())
+        start_server(Path.home(), runtime_dir=self.runtime_dir)
 
     def _menu_open_server(self, _icon, _item, host: str, port: int):
         host = _norm_host(host)
@@ -890,12 +1108,14 @@ class TrayApp:
         logging.info("Open request: %s", str(path) if path else "(none)")
 
         servers = list_live_servers(self.runtime_dir)
+        logging.info("Discovered %s running server(s)", len(servers))
 
         if not servers:
             # Priority 2-A
             root_dir = self._derive_root_dir_for_target(path)
-            start_server(root_dir)
+            start_server(root_dir, runtime_dir=self.runtime_dir)
 
+            logging.info("Waiting up to %ss for server to appear in runtime dir...", SERVER_START_WAIT_SECONDS)
             deadline = time.time() + SERVER_START_WAIT_SECONDS
             while time.time() < deadline:
                 time.sleep(0.5)
@@ -904,7 +1124,14 @@ class TrayApp:
                     break
 
         if not servers:
-            logging.error("No servers found")
+            msg = (
+                "No running Jupyter servers were detected, and starting a new server did not register within the timeout.\n\n"
+                f"Runtime dir scanned: {self.runtime_dir}\n"
+                f"See log: {LOG_FILE}\n"
+                "Tip: run with --log-level DEBUG for more details."
+            )
+            logging.error(msg)
+            _print_or_messagebox("JupyterLab Tray - No Server Found", msg)
             return
 
         # Priority 2-B
@@ -943,6 +1170,13 @@ class TrayApp:
         self.pystray, self.Menu, self.MenuItem, self.Image, self.ImageDraw = _import_tray_deps()
 
         logging.info("Runtime Dir: %s", str(self.runtime_dir))
+
+        # Extra diagnostics that help when users report 'nothing happens'.
+        logging.info("Log file: %s", str(LOG_FILE))
+        logging.info("IPC info file: %s", str(IPC_INFO_FILE))
+        logging.info("Python: %s", sys.executable)
+        logging.info("JupyterLab installed: %s", _module_available("jupyterlab"))
+        logging.info("Tray is ready. No server is started until you open a path or use the tray menu.")
 
         # Bind IPC: preferred port, else ephemeral.
         self.ipc_port = None
@@ -994,6 +1228,8 @@ def _spawn_detached_child(args: argparse.Namespace, target: Optional[Path]) -> N
         flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
+    logging.info("Spawning detached tray child: %s", _format_cmd(cmd))
+
     subprocess.Popen(
         cmd,
         env=env,
@@ -1039,6 +1275,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     _configure_logging(str(args.log_level), also_console=bool(args.foreground and _has_windows_console()))
 
+    logging.info("JupyterLab Tray starting (pid=%s)", os.getpid())
+    logging.info("Args: %s", sys.argv)
+    logging.info("Foreground=%s  Child=%s  HasConsole=%s", bool(args.foreground), os.environ.get("JLAB_TRAY_CHILD") == "1", _has_windows_console())
+    logging.info("Log file: %s", str(LOG_FILE))
+    logging.info("Server output is captured in this log (lines prefixed with [JupyterLab]).")
+
     target: Optional[Path]
     if args.path:
         try:
@@ -1063,6 +1305,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not ping or ping.get("app") != APP_ID:
             continue
         if _ipc_send_open(port, str(target) if target is not None else None):
+            logging.info("Sent open request to existing tray on 127.0.0.1:%s", port)
             _print_or_messagebox(
                 "JupyterLab Tray",
                 f">> Sent open request to existing tray on 127.0.0.1:{port}",
@@ -1091,6 +1334,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Detach
     try:
+        logging.info("Detaching to background mode")
         _print_or_messagebox(
             "JupyterLab Tray",
             "Launching JupyterLab tray in the background...\n"
