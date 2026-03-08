@@ -334,6 +334,50 @@ def _pid_int(x: Any) -> Optional[int]:
 
 
 _RUNTIME_DIR_LOGGED = False
+_JUPYTER_INSTALL_DIAG: str = ""
+_JUPYTER_INSTALLED: bool = True
+
+
+def _jupyter_install_help() -> str:
+    exe = sys.executable
+    return (
+        'To install a basic working JupyterLab environment, run:\n\n'
+        f'  {exe} -m pip install --upgrade pip\n'
+        f'  {exe} -m pip install jupyterlab\n\n'
+        'Then restart the tray.'
+    )
+
+
+
+def _set_jupyter_missing(diag: str) -> None:
+    global _JUPYTER_INSTALLED, _JUPYTER_INSTALL_DIAG
+    _JUPYTER_INSTALLED = False
+    _JUPYTER_INSTALL_DIAG = str(diag or "").strip()
+
+
+def _detect_jupyter_installation() -> tuple[bool, str]:
+    """Return (installed, diagnostic).
+
+    We treat missing 'jupyter_core' or missing 'jupyter' module as 'Jupyter not installed'.
+    """
+    try:
+        import jupyter_core  # noqa: F401
+    except Exception as e:
+        return False, f"Python module 'jupyter_core' not found: {e}"
+
+    # Ensure `python -m jupyter` is runnable
+    try:
+        out = subprocess.check_output([sys.executable, '-m', 'jupyter', '--version'], stderr=subprocess.STDOUT)
+        _ = out.decode('utf-8', errors='replace').strip()
+        return True, ""
+    except subprocess.CalledProcessError as e:
+        out = (getattr(e, 'output', b'') or b'').decode('utf-8', errors='replace').strip()
+        if not out:
+            out = f"exit={e.returncode}"
+        return False, f"'python -m jupyter --version' failed (exit={e.returncode}): {out}"
+    except Exception as e:
+        return False, f"'python -m jupyter --version' could not be executed: {e}"
+
 
 
 def get_jupyter_runtime_dir() -> Path:
@@ -378,6 +422,10 @@ def get_jupyter_runtime_dir() -> Path:
         failures.append(f"jupyter_core: {e}")
         logging.debug("jupyter_core runtime dir lookup failed", exc_info=True)
 
+    # If jupyter_core is missing, Jupyter is not installed in this environment.
+    if any('No module named' in f and 'jupyter_core' in f for f in failures):
+        _set_jupyter_missing(failures[-1])
+
     # 3) Subprocess fallbacks (capture stderr for diagnostics)
     try:
         out = subprocess.check_output([sys.executable, "-m", "jupyter", "--runtime-dir"], stderr=subprocess.STDOUT)
@@ -413,6 +461,16 @@ def get_jupyter_runtime_dir() -> Path:
         failures.append(f"python -m jupyter --paths --json: {e}")
         logging.debug("`python -m jupyter --paths --json` failed", exc_info=True)
 
+
+    # Detect missing Jupyter installation from subprocess output
+    joined = ' | '.join(failures)
+    if ("No module named jupyter" in joined) or ("No module named 'jupyter'" in joined) or ("No module named jupyter_core" in joined):
+        _set_jupyter_missing(joined)
+        logging.error(
+            'Jupyter does not appear to be installed in this Python environment. %s\n%s',
+            joined,
+            _jupyter_install_help(),
+        )
     # 4) Default fallbacks (Windows-focused)
     appdata = os.environ.get("APPDATA")
     if appdata:
@@ -617,6 +675,17 @@ def _creationflags_no_window() -> int:
 
 
 def start_server(root_dir: Path, runtime_dir: Optional[Path] = None) -> Optional[subprocess.Popen]:
+    installed, diag = _detect_jupyter_installation()
+    if not installed:
+        msg = (
+            'Cannot start JupyterLab because Jupyter is not installed in this Python environment.\n\n'
+            f'Diagnostics:\n{diag}\n\n'
+            + _jupyter_install_help()
+        )
+        logging.error(msg)
+        _print_or_messagebox('JupyterLab Tray - Jupyter Not Installed', msg)
+        return None
+
     """Start a new JupyterLab server.
 
     Old behavior discarded stdout/stderr, which made failures (missing jupyterlab,
@@ -1168,6 +1237,17 @@ class TrayApp:
 
     def run(self) -> None:
         self.pystray, self.Menu, self.MenuItem, self.Image, self.ImageDraw = _import_tray_deps()
+
+        installed, diag = _detect_jupyter_installation()
+        if not installed:
+            msg = (
+                'Jupyter does not appear to be installed in this Python environment.\n\n'
+                f'Diagnostics:\n{diag}\n\n'
+                + _jupyter_install_help()
+            )
+            logging.error(msg)
+            _print_or_messagebox('JupyterLab Tray - Jupyter Not Installed', msg)
+            return
 
         logging.info("Runtime Dir: %s", str(self.runtime_dir))
 
