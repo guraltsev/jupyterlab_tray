@@ -70,6 +70,23 @@ class RuntimeDiscoveryTests(unittest.TestCase):
         self.assertEqual(servers[0]["pid"], 2222)
         self.assertEqual(servers[0]["token"], "newtoken")
 
+    def test_listener_map_is_queried_once_per_scan(self) -> None:
+        self._write_runtime("jpserver-1111.json", pid=1111, token="oldtoken", root_dir="/old")
+        self._write_runtime("jpserver-2222.json", pid=2222, token="newtoken", root_dir="/current")
+
+        calls = {"count": 0}
+
+        def fake_listeners() -> dict[int, set[int]]:
+            calls["count"] += 1
+            return {8889: {2222}}
+
+        MODULE._windows_listening_pids_by_port = fake_listeners
+
+        servers = MODULE.list_live_servers(self.runtime_dir)
+        self.assertEqual(len(servers), 1)
+        self.assertEqual(servers[0]["pid"], 2222)
+        self.assertEqual(calls["count"], 1)
+
     def test_token_redaction_preserves_prefix(self) -> None:
         redacted = MODULE._redact_tokens_in_text(
             "Jupyter URL: http://localhost:8889/lab?token=abc123&next=%2Flab"

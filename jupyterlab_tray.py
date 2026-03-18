@@ -45,7 +45,6 @@ LOG_FILE = Path(tempfile.gettempdir()) / "jlab_tray.log"
 
 DEFAULT_IPC_PORT = 8765
 
-MENU_REFRESH_SECONDS = 2.0
 TOKEN_WAIT_SECONDS = 2.0
 SERVER_START_WAIT_SECONDS = 15.0
 TCP_ALIVE_TIMEOUT = 0.2
@@ -368,7 +367,7 @@ def _detect_jupyter_installation() -> tuple[bool, str]:
 
     # Ensure `python -m jupyter` is runnable
     try:
-        out = subprocess.check_output([sys.executable, '-m', 'jupyter', '--version'], stderr=subprocess.STDOUT)
+        out = _check_output_no_window([sys.executable, '-m', 'jupyter', '--version'], stderr=subprocess.STDOUT)
         _ = out.decode('utf-8', errors='replace').strip()
         return True, ""
     except subprocess.CalledProcessError as e:
@@ -429,7 +428,7 @@ def get_jupyter_runtime_dir() -> Path:
 
     # 3) Subprocess fallbacks (capture stderr for diagnostics)
     try:
-        out = subprocess.check_output([sys.executable, "-m", "jupyter", "--runtime-dir"], stderr=subprocess.STDOUT)
+        out = _check_output_no_window([sys.executable, "-m", "jupyter", "--runtime-dir"], stderr=subprocess.STDOUT)
         p = _ensure_dir(Path(out.decode("utf-8", errors="replace").strip()))
         if not _RUNTIME_DIR_LOGGED:
             logging.info("Jupyter runtime dir (`python -m jupyter --runtime-dir`): %s", str(p))
@@ -444,7 +443,7 @@ def get_jupyter_runtime_dir() -> Path:
         logging.debug("`python -m jupyter --runtime-dir` failed", exc_info=True)
 
     try:
-        out = subprocess.check_output([sys.executable, "-m", "jupyter", "--paths", "--json"], stderr=subprocess.STDOUT)
+        out = _check_output_no_window([sys.executable, "-m", "jupyter", "--paths", "--json"], stderr=subprocess.STDOUT)
         data = json.loads(out)
         runtime_dirs = data.get("runtime", [])
         if runtime_dirs:
@@ -517,90 +516,141 @@ def _server_score(d: Dict[str, Any]) -> int:
     return score
 
 
-def _server_candidate_key(d: Dict[str, Any]) -> Tuple[int, int, float, str]:
-    pid_state = d.get("_pid_listening")
-    if pid_state is True:
-        pid_rank = 2
-    elif pid_state is None:
-        pid_rank = 1
-    else:
-        pid_rank = 0
+def _runtime_file_mtime(fpath: str) -> float:
+    try:
+        return float(os.path.getmtime(fpath))
+    except Exception:
+        return 0.0
 
+
+def _windows_listening_pids_by_port() -> Optional[Dict[int, set[int]]]:
+    if not _is_windows():
+        return None
+
+    try:
+        out = _check_output_no_window(["netstat", "-ano", "-p", "TCP"], stderr=subprocess.DEVNULL)
+        text = out.decode("utf-8", errors="replace")
+
+        listeners: Dict[int, set[int]] = {}
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            if parts[0].upper() != "TCP":
+                continue
+            if parts[3].upper() != "LISTENING":
+                continue
+
+            port_match = _NETSTAT_PORT_RE.search(parts[1])
+            pid = _pid_int(parts[4])
+            if not port_match or pid is None:
+                continue
+
+            port = int(port_match.group(1))
+            listeners.setdefault(port, set()).add(int(pid))
+
+        return listeners
+    except Exception:
+        logging.debug("netstat check failed", exc_info=True)
+        return None
+
+
+def _pid_listening_on_port(pid: int, port: int, windows_listeners: Optional[Dict[int, set[int]]] = None) -> Optional[bool]:
+    if not _is_windows():
+        return None
+
+    if windows_listeners is None:
+        windows_listeners = _windows_listening_pids_by_port()
+    if windows_listeners is None:
+        return None
+
+    return int(pid) in windows_listeners.get(int(port), set())
+
+
+def _server_preference_key(d: Dict[str, Any]) -> Tuple[int, int, int, float]:
+    pid_port_match = d.get("_pid_port_match")
+    pid_rank = 2 if pid_port_match is True else 1 if pid_port_match is None else 0
     return (
         pid_rank,
+        1 if d.get("pid") is not None else 0,
         _server_score(d),
-        float(d.get("_mtime") or 0.0),
-        str(d.get("_source_file") or ""),
+        float(d.get("_runtime_mtime") or 0.0),
     )
-
 
 
 def list_live_servers(runtime_dir: Optional[Path]) -> List[Dict[str, Any]]:
     if not runtime_dir or not runtime_dir.exists():
         return []
 
-    patterns = [runtime_dir / "nbserver-*.json", runtime_dir / "jpserver-*.json"]
+    patterns = [runtime_dir / "jpserver-*.json", runtime_dir / "nbserver-*.json"]
     files: List[str] = []
     for pat in patterns:
         files.extend(glob.glob(str(pat)))
 
     try:
-        files.sort(key=lambda p: (os.path.getmtime(p), str(p)), reverse=True)
+        files.sort(key=lambda p: (_runtime_file_mtime(p), str(p)), reverse=True)
     except Exception:
         files.sort(reverse=True)
+
+    if not files:
+        return []
 
     port_listeners = _windows_listening_pids_by_port() if _is_windows() else None
     unique: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     for fpath in files:
         try:
-            src = Path(fpath)
-            with open(src, "r", encoding="utf-8") as f:
+            with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             url = data.get("url")
-            if not url:
+            port = data.get("port")
+            if not url or port is None:
                 continue
 
-            host, port = _extract_host_port(url, _pid_int(data.get("port")))
+            host, port = _extract_host_port(str(url), int(port))
             if port is None:
                 continue
 
             data["port"] = int(port)
             data["pid"] = _pid_int(data.get("pid"))
             data["_host"] = host
-            data["_source_file"] = src.name
-            try:
-                data["_mtime"] = src.stat().st_mtime
-            except Exception:
-                data["_mtime"] = 0.0
+            data["_source_file"] = Path(fpath).name
+            data["_runtime_mtime"] = _runtime_file_mtime(fpath)
+            data["_pid_port_match"] = None
 
             if not _tcp_alive(url):
                 continue
 
-            pid_state: Optional[bool] = None
-            if data["pid"] is not None:
-                pid_state = _pid_listening_on_port(int(data["pid"]), int(data["port"]), port_listeners)
-                if pid_state is False:
-                    logging.info(
+            pid = data.get("pid")
+            if pid is not None:
+                pid_port_match = _pid_listening_on_port(int(pid), int(port), port_listeners)
+                data["_pid_port_match"] = pid_port_match
+                if pid_port_match is False:
+                    logging.debug(
                         "Ignoring stale runtime file %s: PID %s is not listening on port %s",
-                        src.name,
-                        data["pid"],
-                        data["port"],
+                        fpath,
+                        pid,
+                        port,
                     )
                     continue
-            data["_pid_listening"] = pid_state
 
             key = (host, int(port))
-            if key not in unique or _server_candidate_key(data) > _server_candidate_key(unique[key]):
+            prev = unique.get(key)
+            if prev is None or _server_preference_key(data) > _server_preference_key(prev):
                 unique[key] = data
 
         except Exception:
             logging.debug("Failed to parse runtime file: %s", fpath, exc_info=True)
 
     out_list = list(unique.values())
-    out_list.sort(key=lambda d: (int(d.get("port", 0)), str(d.get("_host", ""))))
+    out_list.sort(key=lambda d: (str(d.get("_host") or ""), int(d.get("port") or 0)))
     return out_list
+
 
 
 def _server_root_url(server: Dict[str, Any]) -> str:
@@ -692,17 +742,28 @@ def _path_under_root(target: Path, root_dir: str) -> bool:
         return False
 
 
-def _pick_best_server_for_path(servers: List[Dict[str, Any]], target: Optional[Path]) -> Optional[Dict[str, Any]]:
+def _pick_best_server_for_path(
+    servers: List[Dict[str, Any]],
+    target: Optional[Path],
+    preferred_pid: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     if not servers:
         return None
-    if target is None:
-        return max(servers, key=_server_score)
 
-    visible = [s for s in servers if _path_under_root(target, str(s.get("root_dir") or ""))]
+    candidates = list(servers)
+    if preferred_pid is not None:
+        preferred = [s for s in candidates if _pid_int(s.get("pid")) == int(preferred_pid)]
+        if preferred:
+            candidates = preferred
+
+    if target is None:
+        return max(candidates, key=_server_score)
+
+    visible = [s for s in candidates if _path_under_root(target, str(s.get("root_dir") or ""))]
     if visible:
         return max(visible, key=_server_score)
 
-    return max(servers, key=_server_score)
+    return max(candidates, key=_server_score)
 
 
 # -------------------- Start / Open --------------------
@@ -715,6 +776,31 @@ def _creationflags_no_window() -> int:
     flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     return flags
+
+
+def _subprocess_no_window_kwargs() -> Dict[str, Any]:
+    if not _is_windows():
+        return {}
+
+    kwargs: Dict[str, Any] = {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+    }
+
+    startupinfo_type = getattr(subprocess, "STARTUPINFO", None)
+    if startupinfo_type is not None:
+        try:
+            si = startupinfo_type()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+            si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kwargs["startupinfo"] = si
+        except Exception:
+            logging.debug("Failed to create hidden STARTUPINFO", exc_info=True)
+
+    return kwargs
+
+
+def _check_output_no_window(args: List[str], **kwargs: Any) -> bytes:
+    return subprocess.check_output(args, **_subprocess_no_window_kwargs(), **kwargs)
 
 
 def start_server(root_dir: Path, runtime_dir: Optional[Path] = None) -> Optional[subprocess.Popen]:
@@ -855,11 +941,11 @@ def open_in_browser(url: str) -> None:
 # -------------------- Priority 1: safer shutdown --------------------
 
 
-def _http_post(url: str, timeout: float) -> Tuple[bool, str]:
+def _http_post(url: str, timeout: float, headers: Optional[Dict[str, str]] = None) -> Tuple[bool, str]:
     try:
         import urllib.request
 
-        req = urllib.request.Request(url, method="POST")
+        req = urllib.request.Request(url, method="POST", headers=dict(headers or {}))
         with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
             if 200 <= int(resp.status) < 300:
                 return True, ""
@@ -876,76 +962,21 @@ def _shutdown_via_http(server: Dict[str, Any]) -> bool:
     token = str(server.get("token") or "")
     base = urljoin(root, "api/shutdown")
 
-    urls = []
+    attempts: List[Tuple[str, Dict[str, str]]] = []
     if token:
+        attempts.append((base, {"Authorization": f"token {token}"}))
         joiner = "&" if "?" in base else "?"
-        urls.append(f"{base}{joiner}token={quote(token)}")
-    urls.append(base)
+        attempts.append((f"{base}{joiner}token={quote(token)}", {}))
+    attempts.append((base, {}))
 
-    for u in urls:
-        ok, err = _http_post(u, timeout=HTTP_SHUTDOWN_TIMEOUT)
+    for u, headers in attempts:
+        ok, err = _http_post(u, timeout=HTTP_SHUTDOWN_TIMEOUT, headers=headers)
         if ok:
             logging.info("Shutdown via HTTP succeeded (%s)", _redact_token(u))
             return True
         logging.debug("Shutdown via HTTP failed (%s): %s", _redact_token(u), err)
 
     return False
-
-
-def _windows_listening_pids_by_port() -> Optional[Dict[int, set[int]]]:
-    if not _is_windows():
-        return None
-
-    try:
-        out = subprocess.check_output(["netstat", "-ano", "-p", "TCP"], stderr=subprocess.DEVNULL)
-        text = out.decode("utf-8", errors="replace")
-
-        listeners: Dict[int, set[int]] = {}
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            parts = line.split()
-            if len(parts) < 5:
-                continue
-            if parts[0].upper() != "TCP":
-                continue
-            if parts[3].upper() != "LISTENING":
-                continue
-
-            port_match = _NETSTAT_PORT_RE.search(parts[1])
-            pid = _pid_int(parts[4])
-            if not port_match or pid is None:
-                continue
-
-            port = int(port_match.group(1))
-            listeners.setdefault(port, set()).add(int(pid))
-
-        return listeners
-    except Exception:
-        logging.debug("netstat check failed", exc_info=True)
-        return None
-
-
-
-def _windows_pid_listening_on_port(pid: int, port: int, listeners: Optional[Dict[int, set[int]]] = None) -> Optional[bool]:
-    if not _is_windows():
-        return None
-
-    if listeners is None:
-        listeners = _windows_listening_pids_by_port()
-    if listeners is None:
-        return None
-
-    return int(pid) in listeners.get(int(port), set())
-
-
-
-def _pid_listening_on_port(pid: int, port: int, windows_listeners: Optional[Dict[int, set[int]]] = None) -> Optional[bool]:
-    if _is_windows():
-        return _windows_pid_listening_on_port(pid, port, windows_listeners)
-    return None
 
 
 def shutdown_server(server: Dict[str, Any]) -> None:
@@ -963,13 +994,9 @@ def shutdown_server(server: Dict[str, Any]) -> None:
         return
 
     port = int(server.get("port") or 0)
-    pid_ok = _pid_listening_on_port(pid, port)
+    pid_ok = _windows_pid_listening_on_port(pid, port)
     if pid_ok is False:
-        logging.warning(
-            "Skipping PID %s fallback: runtime record is stale or the server has already stopped (not listening on port %s)",
-            pid,
-            port,
-        )
+        logging.error("Refusing to kill PID %s: not listening on port %s", pid, port)
         return
 
     try:
@@ -1056,6 +1083,13 @@ class IPCHandler(socketserver.StreamRequestHandler):
                 return
             msg = json.loads(line)
 
+            try:
+                app = getattr(self.server, "app", None)
+                if app is not None and hasattr(app, "_touch_ipc_info"):
+                    app._touch_ipc_info()  # type: ignore[attr-defined]
+            except Exception:
+                logging.debug("Failed to refresh IPC info on incoming request", exc_info=True)
+
             cmd = msg.get("cmd")
             if cmd == "ping":
                 self.wfile.write(
@@ -1108,7 +1142,6 @@ class TrayApp:
         self.instance_id = uuid.uuid4().hex
 
         self._stop = threading.Event()
-        self._cached_sig: List[Tuple[str, int]] = []
 
         self.pystray = None
         self.Menu = None
@@ -1142,9 +1175,11 @@ class TrayApp:
         return img
 
     def _menu_start_new_server(self, _icon, _item):
+        self._touch_ipc_info()
         start_server(Path.home(), runtime_dir=self.runtime_dir)
 
     def _menu_open_server(self, _icon, _item, host: str, port: int):
+        self._touch_ipc_info()
         host = _norm_host(host)
         best = _best_server_for_host_port(self.runtime_dir, host, int(port))
         if best:
@@ -1153,6 +1188,7 @@ class TrayApp:
             open_in_browser(f"http://{host}:{int(port)}/lab")
 
     def _menu_shutdown_server(self, _icon, _item, host: str, port: int):
+        self._touch_ipc_info()
         host = _norm_host(host)
         best = _best_server_for_host_port(self.runtime_dir, host, int(port), wait_for_token=0.0)
         if not best:
@@ -1163,13 +1199,17 @@ class TrayApp:
     def _menu_quit(self, _icon, _item):
         self.quit()
 
-    def _build_menu(self):
+    def _touch_ipc_info(self) -> None:
+        if self.ipc_port is None:
+            return
+        _write_ipc_info(self.ipc_port, self.instance_id)
+
+    def _iter_menu_items(self):
         Menu = self.Menu
         MenuItem = self.MenuItem
 
-        items = []
-        items.append(MenuItem("Start New Server", self._menu_start_new_server))
-        items.append(Menu.SEPARATOR)
+        yield MenuItem("Start New Server", self._menu_start_new_server)
+        yield Menu.SEPARATOR
 
         try:
             servers = list_live_servers(self.runtime_dir)
@@ -1177,10 +1217,8 @@ class TrayApp:
             logging.debug("list_live_servers failed", exc_info=True)
             servers = []
 
-        self._cached_sig = [(str(s.get("_host") or ""), int(s.get("port") or 0)) for s in servers]
-
         if not servers:
-            items.append(MenuItem("No active servers", lambda _i, _it: None, enabled=False))
+            yield MenuItem("No active servers", lambda _i, _it: None, enabled=False)
         else:
             for s in servers:
                 host = str(s.get("_host") or "127.0.0.1")
@@ -1197,37 +1235,15 @@ class TrayApp:
                     MenuItem("Open Lab", open_cb),
                     MenuItem("Shutdown", shutdown_cb, enabled=shutdown_enabled),
                 )
-                items.append(MenuItem(label, submenu))
+                yield MenuItem(label, submenu)
 
-        items.append(Menu.SEPARATOR)
-        items.append(MenuItem("Quit Tray", self._menu_quit))
+        yield Menu.SEPARATOR
+        yield MenuItem("Quit Tray", self._menu_quit)
 
-        return Menu(*items)
-
-    def _monitor(self):
-        while not self._stop.is_set():
-            time.sleep(MENU_REFRESH_SECONDS)
-
-            try:
-                servers = list_live_servers(self.runtime_dir)
-                sig = [(str(s.get("_host") or ""), int(s.get("port") or 0)) for s in servers]
-                if sig != self._cached_sig and self.icon is not None:
-                    logging.info("Updating menu...")
-                    try:
-                        self.icon.menu = self._build_menu()
-                        if hasattr(self.icon, "update_menu"):
-                            try:
-                                self.icon.update_menu()  # type: ignore[attr-defined]
-                            except Exception:
-                                pass
-                    except Exception:
-                        logging.debug("Menu update failed", exc_info=True)
-
-                if self.ipc_port is not None:
-                    _write_ipc_info(self.ipc_port, self.instance_id)
-
-            except Exception:
-                logging.debug("Monitor thread error", exc_info=True)
+    def _build_menu(self):
+        # Use pystray's dynamic menu support so runtime discovery only happens
+        # when the user interacts with the tray icon/menu, not on a periodic timer.
+        return self.Menu(self._iter_menu_items)
 
     def _derive_root_dir_for_target(self, target: Optional[Path]) -> Path:
         if target is None:
@@ -1250,22 +1266,36 @@ class TrayApp:
         return Path.home()
 
     def handle_open_request(self, path: Optional[Path]) -> None:
+        self._touch_ipc_info()
         logging.info("Open request: %s", str(path) if path else "(none)")
 
         servers = list_live_servers(self.runtime_dir)
         logging.info("Discovered %s running server(s)", len(servers))
 
+        preferred_pid: Optional[int] = None
+
         if not servers:
             # Priority 2-A
             root_dir = self._derive_root_dir_for_target(path)
-            start_server(root_dir, runtime_dir=self.runtime_dir)
+            proc = start_server(root_dir, runtime_dir=self.runtime_dir)
+            preferred_pid = _pid_int(getattr(proc, "pid", None)) if proc is not None else None
+            if preferred_pid is not None:
+                logging.info("Waiting for runtime info from newly started server PID %s", preferred_pid)
 
             logging.info("Waiting up to %ss for server to appear in runtime dir...", SERVER_START_WAIT_SECONDS)
             deadline = time.time() + SERVER_START_WAIT_SECONDS
             while time.time() < deadline:
                 time.sleep(0.5)
-                servers = list_live_servers(self.runtime_dir)
-                if servers:
+                discovered = list_live_servers(self.runtime_dir)
+                if discovered:
+                    servers = discovered
+                if not discovered:
+                    continue
+                if preferred_pid is None:
+                    break
+                matches = [s for s in discovered if _pid_int(s.get("pid")) == preferred_pid]
+                if matches:
+                    servers = matches
                     break
 
         if not servers:
@@ -1280,7 +1310,7 @@ class TrayApp:
             return
 
         # Priority 2-B
-        best = _pick_best_server_for_path(servers, path)
+        best = _pick_best_server_for_path(servers, path, preferred_pid=preferred_pid)
         if best is None:
             logging.error("Failed to select a server")
             return
@@ -1291,10 +1321,11 @@ class TrayApp:
             while time.time() < deadline2:
                 time.sleep(0.1)
                 servers2 = list_live_servers(self.runtime_dir)
-                cand = _pick_best_server_for_path(servers2, path)
-                if cand and cand.get("token"):
+                cand = _pick_best_server_for_path(servers2, path, preferred_pid=preferred_pid)
+                if cand:
                     best = cand
-                    break
+                    if cand.get("token"):
+                        break
 
         open_in_browser(lab_url(best, path))
 
@@ -1353,8 +1384,6 @@ class TrayApp:
 
         if self.initial_path is not None:
             threading.Thread(target=self.handle_open_request, args=(self.initial_path,), daemon=True).start()
-
-        threading.Thread(target=self._monitor, daemon=True).start()
 
         self.icon = self.pystray.Icon(
             "JupyterLab",
