@@ -145,12 +145,13 @@ def _format_cmd(cmd: List[str]) -> str:
 
 
 _TOKEN_QS_RE = re.compile(r"(\btoken=)[^&\s]+", re.IGNORECASE)
+_NETSTAT_PORT_RE = re.compile(r":(\d+)$")
 
 
 def _redact_tokens_in_text(text: str) -> str:
     """Redact token=... fragments that commonly appear in Jupyter URLs."""
     try:
-        return _TOKEN_QS_RE.sub(r"\\1REDACTED", text)
+        return _TOKEN_QS_RE.sub(r"\1REDACTED", text)
     except Exception:
         return text
 
@@ -516,6 +517,24 @@ def _server_score(d: Dict[str, Any]) -> int:
     return score
 
 
+def _server_candidate_key(d: Dict[str, Any]) -> Tuple[int, int, float, str]:
+    pid_state = d.get("_pid_listening")
+    if pid_state is True:
+        pid_rank = 2
+    elif pid_state is None:
+        pid_rank = 1
+    else:
+        pid_rank = 0
+
+    return (
+        pid_rank,
+        _server_score(d),
+        float(d.get("_mtime") or 0.0),
+        str(d.get("_source_file") or ""),
+    )
+
+
+
 def list_live_servers(runtime_dir: Optional[Path]) -> List[Dict[str, Any]]:
     if not runtime_dir or not runtime_dir.exists():
         return []
@@ -525,11 +544,18 @@ def list_live_servers(runtime_dir: Optional[Path]) -> List[Dict[str, Any]]:
     for pat in patterns:
         files.extend(glob.glob(str(pat)))
 
+    try:
+        files.sort(key=lambda p: (os.path.getmtime(p), str(p)), reverse=True)
+    except Exception:
+        files.sort(reverse=True)
+
+    port_listeners = _windows_listening_pids_by_port() if _is_windows() else None
     unique: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     for fpath in files:
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
+            src = Path(fpath)
+            with open(src, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             url = data.get("url")
@@ -543,13 +569,30 @@ def list_live_servers(runtime_dir: Optional[Path]) -> List[Dict[str, Any]]:
             data["port"] = int(port)
             data["pid"] = _pid_int(data.get("pid"))
             data["_host"] = host
-            data["_source_file"] = Path(fpath).name
+            data["_source_file"] = src.name
+            try:
+                data["_mtime"] = src.stat().st_mtime
+            except Exception:
+                data["_mtime"] = 0.0
 
             if not _tcp_alive(url):
                 continue
 
+            pid_state: Optional[bool] = None
+            if data["pid"] is not None:
+                pid_state = _pid_listening_on_port(int(data["pid"]), int(data["port"]), port_listeners)
+                if pid_state is False:
+                    logging.info(
+                        "Ignoring stale runtime file %s: PID %s is not listening on port %s",
+                        src.name,
+                        data["pid"],
+                        data["port"],
+                    )
+                    continue
+            data["_pid_listening"] = pid_state
+
             key = (host, int(port))
-            if key not in unique or _server_score(data) > _server_score(unique[key]):
+            if key not in unique or _server_candidate_key(data) > _server_candidate_key(unique[key]):
                 unique[key] = data
 
         except Exception:
@@ -849,31 +892,60 @@ def _shutdown_via_http(server: Dict[str, Any]) -> bool:
     return False
 
 
-def _windows_pid_listening_on_port(pid: int, port: int) -> Optional[bool]:
+def _windows_listening_pids_by_port() -> Optional[Dict[int, set[int]]]:
     if not _is_windows():
         return None
+
     try:
-        out = subprocess.check_output(["netstat", "-ano"], stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(["netstat", "-ano", "-p", "TCP"], stderr=subprocess.DEVNULL)
         text = out.decode("utf-8", errors="replace")
-        needle = f":{int(port)}"
-        pid_str = str(int(pid))
 
-        saw_port = False
-        for line in text.splitlines():
-            if needle not in line:
+        listeners: Dict[int, set[int]] = {}
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
                 continue
-            if "LISTENING" not in line.upper():
-                continue
-            saw_port = True
-            if line.strip().endswith(pid_str):
-                return True
 
-        if saw_port:
-            return False
-        return False
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            if parts[0].upper() != "TCP":
+                continue
+            if parts[3].upper() != "LISTENING":
+                continue
+
+            port_match = _NETSTAT_PORT_RE.search(parts[1])
+            pid = _pid_int(parts[4])
+            if not port_match or pid is None:
+                continue
+
+            port = int(port_match.group(1))
+            listeners.setdefault(port, set()).add(int(pid))
+
+        return listeners
     except Exception:
         logging.debug("netstat check failed", exc_info=True)
         return None
+
+
+
+def _windows_pid_listening_on_port(pid: int, port: int, listeners: Optional[Dict[int, set[int]]] = None) -> Optional[bool]:
+    if not _is_windows():
+        return None
+
+    if listeners is None:
+        listeners = _windows_listening_pids_by_port()
+    if listeners is None:
+        return None
+
+    return int(pid) in listeners.get(int(port), set())
+
+
+
+def _pid_listening_on_port(pid: int, port: int, windows_listeners: Optional[Dict[int, set[int]]] = None) -> Optional[bool]:
+    if _is_windows():
+        return _windows_pid_listening_on_port(pid, port, windows_listeners)
+    return None
 
 
 def shutdown_server(server: Dict[str, Any]) -> None:
@@ -891,9 +963,13 @@ def shutdown_server(server: Dict[str, Any]) -> None:
         return
 
     port = int(server.get("port") or 0)
-    pid_ok = _windows_pid_listening_on_port(pid, port)
+    pid_ok = _pid_listening_on_port(pid, port)
     if pid_ok is False:
-        logging.error("Refusing to kill PID %s: not listening on port %s", pid, port)
+        logging.warning(
+            "Skipping PID %s fallback: runtime record is stale or the server has already stopped (not listening on port %s)",
+            pid,
+            port,
+        )
         return
 
     try:
